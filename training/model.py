@@ -26,11 +26,12 @@ class MessagePassingBlock(nn.Module):
         positions: torch.Tensor,
         rest_positions: torch.Tensor,
         edge_index: torch.Tensor,
+        length_scale: float,
     ) -> torch.Tensor:
         source = edge_index[0]
         target = edge_index[1]
-        current_delta = positions[source] - positions[target]
-        rest_delta = rest_positions[source] - rest_positions[target]
+        current_delta = (positions[source] - positions[target]) / length_scale
+        rest_delta = (rest_positions[source] - rest_positions[target]) / length_scale
         rest_length = torch.linalg.vector_norm(rest_delta, dim=-1, keepdim=True)
         edge_features = torch.cat((current_delta, rest_delta, rest_length), dim=-1)
         message_input = torch.cat(
@@ -73,6 +74,8 @@ class MeshGraphSimulator(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, 3),
         )
+        nn.init.zeros_(self.decoder[-1].weight)
+        nn.init.zeros_(self.decoder[-1].bias)
 
     def forward(
         self,
@@ -80,9 +83,24 @@ class MeshGraphSimulator(nn.Module):
         positions: torch.Tensor,
         velocities: torch.Tensor,
         edge_index: torch.Tensor,
+        length_scale: float = 1.0,
+        velocity_scale: float = 1.0,
+        acceleration_scale: float = 1.0,
     ) -> torch.Tensor:
-        features = torch.cat((positions - rest_positions, velocities, rest_positions), dim=-1)
+        centered_rest_positions = rest_positions - torch.mean(
+            rest_positions, dim=0, keepdim=True
+        )
+        features = torch.cat(
+            (
+                (positions - rest_positions) / length_scale,
+                velocities / velocity_scale,
+                centered_rest_positions / length_scale,
+            ),
+            dim=-1,
+        )
         hidden = self.encoder(features)
         for block in self.blocks:
-            hidden = block(hidden, positions, rest_positions, edge_index)
-        return self.decoder(hidden)
+            hidden = block(
+                hidden, positions, rest_positions, edge_index, length_scale
+            )
+        return self.decoder(hidden) * acceleration_scale
