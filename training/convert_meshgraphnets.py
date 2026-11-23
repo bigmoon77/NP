@@ -181,7 +181,18 @@ def main() -> None:
         if positions.shape[0] < 2:
             raise ValueError("Trajectory must contain at least two frames")
 
+        if not np.isfinite(positions).all():
+            raise ValueError("Position trajectory contains NaN or infinity")
+
         cells = decode_feature(record, "cells", fields["cells"])
+        if cells.ndim == 3:
+            if not np.all(cells == cells[0]):
+                raise ValueError(
+                    "This NPDS importer requires fixed topology, but cells change over time"
+                )
+            cells = cells[0]
+        if cells.ndim != 2 or cells.shape[-1] != 3:
+            raise ValueError(f"Expected triangle cells [faces, 3], got {cells.shape}")
         edges = triangles_to_edges(cells, positions.shape[1])
         output_path = output_dir / f"trajectory_{trajectory_index:05d}.npds"
         write_npds(
