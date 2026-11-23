@@ -8,9 +8,11 @@ uniform float grabStrength;
 uniform vec3 grabCenter;
 uniform vec3 grabTarget;
 uniform float isGrabbing;
+uniform float resetState;
 
 void main() {
   vec2 uv = gl_FragCoord.xy / resolution.xy;
+  if (resetState > 0.5) { gl_FragColor = vec4(0.0); return; }
   vec3 position = texture2D(texturePosition, uv).xyz;
   vec3 velocity = texture2D(textureVelocity, uv).xyz;
   vec3 restPosition = texture2D(textureInitial, uv).xyz;
