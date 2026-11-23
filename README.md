@@ -95,7 +95,7 @@ Train and validate:
 .\.venv\Scripts\python.exe training/train.py --data data/deforming_plate_train --validation-data data/deforming_plate_valid --epochs 100
 ```
 
-Use `--max-trajectories 0` to convert every trajectory in a split. The converter currently imports fixed-topology triangle meshes and position trajectories. Two-dimensional coordinates are padded with a zero Z coordinate. It derives velocity from consecutive positions and the dataset timestep. The DeformingPlate benchmark is structural mechanics data, not a general 3D soft-body dataset; it is used here to validate the public-data ingestion and training pipeline.
+Use `--max-trajectories 0` to convert every trajectory in a split. The converter currently imports fixed-topology triangle meshes and position trajectories. Two-dimensional coordinates are padded with a zero Z coordinate. It derives velocity from consecutive positions. If the metadata provides a positive physical timestep, that value is used; otherwise the importer uses `--timestep 1.0` (one normalized frame interval). DeformingPlate does not provide a usable physical `dt`, so the fallback keeps derivatives in frame-based units; it does not recover physical seconds. The DeformingPlate benchmark is structural mechanics data, not a general 3D soft-body dataset; it is used here to validate the public-data ingestion and training pipeline.
 
 Source: https://github.com/google-deepmind/deepmind-research/tree/master/meshgraphnets
 
