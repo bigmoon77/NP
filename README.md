@@ -34,6 +34,16 @@ Then visit http://localhost:8000.
 - Spring interactions use the four parametric grid neighbors
 - A shape-restoration term helps preserve the spherical rest shape
 
+## Dataset capture
+
+The browser recorder exports `.npds` binary trajectory files. Version 1 stores a JSON metadata header followed by little-endian arrays in this order:
+
+1. Rest positions: float32 [N, 3]
+2. Undirected triangle edges: uint32 [E, 2]
+3. For each frame: positions float32 [N, 3], then velocities float32 [N, 3]
+
+The file starts with the 8-byte magic `NPDS0001`, followed by a uint32 little-endian JSON-header byte length. Captures are sampled at 10, 20, or 30 Hz. The current sphere is the first data-generation source; use different meshes and material settings in later dataset-generation milestones to test cross-mesh generalization.
+
 ## Roadmap
 
 1. GPU reference solver and interactive 100k-vertex demo
