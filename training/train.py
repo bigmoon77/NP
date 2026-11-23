@@ -130,6 +130,10 @@ def main() -> None:
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--validation-data", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--evaluation-interval", type=int, default=10,
+        help="Run full-trajectory validation every N epochs (also on the final epoch).",
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -173,6 +177,9 @@ def main() -> None:
     else:
         print("Validation disabled; best checkpoint will be selected on training data.")
 
+    if args.evaluation_interval < 1:
+        raise SystemExit("--evaluation-interval must be at least 1")
+
     best_loss = float("inf")
     best_epoch = 0
     best_state = None
@@ -204,6 +211,17 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             epoch_losses.append(loss.item())
+
+        should_evaluate = (
+            (epoch + 1) % args.evaluation_interval == 0
+            or epoch + 1 == args.epochs
+        )
+        if not should_evaluate:
+            print(
+                f"epoch {epoch + 1:04d} "
+                f"train={np.mean(epoch_losses):.6e} eval=skipped"
+            )
+            continue
 
         evaluation_loss, baseline_loss = evaluate_teacher_forced(
             model, evaluation_data
