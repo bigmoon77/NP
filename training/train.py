@@ -19,62 +19,66 @@ def make_edge_index(edges: np.ndarray, device: torch.device) -> torch.Tensor:
 
 
 def prepare_trajectory(trajectory: Trajectory, device: torch.device) -> dict:
-    rest = torch.as_tensor(trajectory.rest_positions, dtype=torch.float32, device=device)
-    positions = torch.as_tensor(trajectory.positions, dtype=torch.float32, device=device)
-    velocities = torch.as_tensor(trajectory.velocities, dtype=torch.float32, device=device)
-    edges = make_edge_index(trajectory.edges, device)
+    if trajectory.node_types is None or trajectory.stress is None:
+        raise ValueError(
+            f"{trajectory.path} is NPDS v1. DeformingPlate training requires NPDS v2; "
+            "re-run training/convert_meshgraphnets.py."
+        )
+    if not np.isin(trajectory.node_types, (0, 1, 3)).all():
+        raise ValueError(f"{trajectory.path}: unsupported DeformingPlate node types")
     return {
         "source": trajectory,
-        "rest": rest,
-        "positions": positions,
-        "velocities": velocities,
-        "edges": edges,
+        "rest": torch.as_tensor(trajectory.rest_positions, dtype=torch.float32, device=device),
+        "positions": torch.as_tensor(trajectory.positions, dtype=torch.float32, device=device),
+        "stress": torch.as_tensor(trajectory.stress, dtype=torch.float32, device=device),
+        "node_types": torch.as_tensor(trajectory.node_types, dtype=torch.long, device=device),
+        "edges": make_edge_index(trajectory.edges, device),
     }
-
 
 
 def compute_normalization(data_list: list[dict]) -> dict[str, float]:
-    """Compute global physical scales from training trajectories only."""
     edge_squared_sum = 0.0
     edge_count = 0
-    velocity_squared_sum = 0.0
-    velocity_count = 0
-    acceleration_squared_sum = 0.0
-    acceleration_count = 0
+    displacement_squared_sum = 0.0
+    displacement_count = 0
+    stress_squared_sum = 0.0
+    stress_count = 0
 
     for data in data_list:
-        source = data["source"]
         rest = data["rest"]
-        edges = data["edges"]
-        edge_delta = rest[edges[0]] - rest[edges[1]]
+        edge_index = data["edges"]
+        edge_delta = rest[edge_index[0]] - rest[edge_index[1]]
         edge_squared_sum += torch.sum(edge_delta * edge_delta).item()
         edge_count += edge_delta.shape[0]
 
-        velocities = data["velocities"]
-        velocity_squared_sum += torch.sum(velocities * velocities).item()
-        velocity_count += velocities.numel()
+        moving_mask = data["node_types"] == 0
+        frame_delta = data["positions"][1:] - data["positions"][:-1]
+        if torch.any(moving_mask):
+            moving_delta = frame_delta[:, moving_mask]
+            displacement_squared_sum += torch.sum(moving_delta * moving_delta).item()
+            displacement_count += moving_delta.numel()
 
-        dt = max(source.dt, 1.0e-6)
-        accelerations = (velocities[1:] - velocities[:-1]) / dt
-        acceleration_squared_sum += torch.sum(
-            accelerations * accelerations
-        ).item()
-        acceleration_count += accelerations.numel()
+        stress = data["stress"]
+        stress_squared_sum += torch.sum(stress * stress).item()
+        stress_count += stress.numel()
 
     length_scale = float(np.sqrt(edge_squared_sum / max(edge_count, 1)))
-    velocity_scale = float(np.sqrt(velocity_squared_sum / max(velocity_count, 1)))
-    acceleration_scale = float(
-        np.sqrt(acceleration_squared_sum / max(acceleration_count, 1))
-    )
-
+    displacement_scale = float(np.sqrt(displacement_squared_sum / max(displacement_count, 1)))
+    stress_scale = float(np.sqrt(stress_squared_sum / max(stress_count, 1)))
     return {
         "length_scale": max(length_scale, 1.0e-8),
-        "velocity_scale": max(velocity_scale, max(length_scale, 1.0e-8) * 1.0e-6),
-        "acceleration_scale": max(
-            acceleration_scale, max(length_scale, 1.0e-8) * 1.0e-8
-        ),
+        "displacement_scale": max(displacement_scale, max(length_scale, 1.0e-8) * 1.0e-6),
+        "stress_scale": max(stress_scale, 1.0e-8),
     }
 
+
+def apply_known_boundary_positions(
+    predicted_positions: torch.Tensor,
+    exact_next_positions: torch.Tensor,
+    node_types: torch.Tensor,
+) -> torch.Tensor:
+    known_mask = (node_types == 1) | (node_types == 3)
+    return torch.where(known_mask.unsqueeze(-1), exact_next_positions, predicted_positions)
 
 
 def compute_rollout_training_loss(
@@ -84,48 +88,32 @@ def compute_rollout_training_loss(
     horizon: int,
     normalization: dict[str, float],
 ) -> torch.Tensor:
-    """Train through a differentiable multi-step simulation rollout."""
-    source = data["source"]
-    dt = max(source.dt, 1.0e-6)
     position = data["positions"][start_frame]
-    velocity = data["velocities"][start_frame]
+    node_types = data["node_types"]
+    moving_mask = node_types == 0
+    if not torch.any(moving_mask):
+        raise ValueError("Trajectory has no moving (node_type=0) vertices")
     step_losses = []
 
     for step in range(horizon):
         frame = start_frame + step
         target_position = data["positions"][frame + 1]
-        target_velocity = data["velocities"][frame + 1]
-        target_acceleration = (
-            target_velocity - data["velocities"][frame]
-        ) / dt
+        target_stress = data["stress"][frame + 1]
+        predicted_delta, predicted_stress = model(
+            data["rest"], position, node_types, data["edges"], **normalization
+        )
+        predicted_position = position + predicted_delta
+        position = apply_known_boundary_positions(predicted_position, target_position, node_types)
 
-        acceleration = model(
-            data["rest"],
-            position,
-            velocity,
-            data["edges"],
-            **normalization,
-        )
-        velocity = velocity + acceleration * dt
-        position = position + velocity * dt
-
-        acceleration_loss = F.mse_loss(
-            acceleration / normalization["acceleration_scale"],
-            target_acceleration / normalization["acceleration_scale"],
-        )
-        velocity_loss = F.mse_loss(
-            velocity / normalization["velocity_scale"],
-            target_velocity / normalization["velocity_scale"],
-        )
         position_loss = F.mse_loss(
-            (position - target_position) / normalization["length_scale"],
-            torch.zeros_like(target_position),
+            (position[moving_mask] - target_position[moving_mask]) / normalization["length_scale"],
+            torch.zeros_like(target_position[moving_mask]),
         )
-        step_losses.append(
-            0.10 * acceleration_loss
-            + 0.25 * velocity_loss
-            + position_loss
+        stress_loss = F.mse_loss(
+            predicted_stress / normalization["stress_scale"],
+            target_stress / normalization["stress_scale"],
         )
+        step_losses.append(position_loss + 0.25 * stress_loss)
 
     return torch.stack(step_losses).mean()
 
@@ -134,123 +122,104 @@ def evaluate_teacher_forced(
     model: MeshGraphSimulator,
     datasets: list[dict],
     normalization: dict[str, float],
-) -> tuple[float, float]:
-    """Evaluate every consecutive frame pair and a zero-acceleration baseline."""
+) -> tuple[float, float, float]:
     model.eval()
-    squared_error_sum = 0.0
-    baseline_error_sum = 0.0
-    value_count = 0
+    delta_error_sum = 0.0
+    zero_error_sum = 0.0
+    stress_error_sum = 0.0
+    delta_count = 0
+    stress_count = 0
 
     with torch.no_grad():
         for data in datasets:
-            source = data["source"]
-            dt = max(source.dt, 1.0e-6)
-            for frame in range(source.frame_count - 1):
-                target = (
-                    data["velocities"][frame + 1] - data["velocities"][frame]
-                ) / dt
-                predicted = model(
-                    data["rest"],
-                    data["positions"][frame],
-                    data["velocities"][frame],
-                    data["edges"],
-                    **normalization,
+            moving_mask = data["node_types"] == 0
+            for frame in range(data["source"].frame_count - 1):
+                target_delta = data["positions"][frame + 1] - data["positions"][frame]
+                predicted_delta, predicted_stress = model(
+                    data["rest"], data["positions"][frame], data["node_types"],
+                    data["edges"], **normalization,
                 )
-                squared_error_sum += F.mse_loss(
-                    predicted, target, reduction="sum"
-                ).item()
-                baseline_error_sum += torch.sum(target * target).item()
-                value_count += target.numel()
+                difference = predicted_delta[moving_mask] - target_delta[moving_mask]
+                delta_error_sum += torch.sum(difference * difference).item()
+                zero_error_sum += torch.sum(target_delta[moving_mask] ** 2).item()
+                delta_count += target_delta[moving_mask].numel()
 
-    if value_count == 0:
-        return float("nan"), float("nan")
-    return squared_error_sum / value_count, baseline_error_sum / value_count
+                stress_difference = predicted_stress - data["stress"][frame + 1]
+                stress_error_sum += torch.sum(stress_difference * stress_difference).item()
+                stress_count += stress_difference.numel()
+
+    if delta_count == 0 or stress_count == 0:
+        return float("nan"), float("nan"), float("nan")
+    return (
+        delta_error_sum / delta_count,
+        zero_error_sum / delta_count,
+        float(np.sqrt(stress_error_sum / stress_count)),
+    )
 
 
-def evaluate_rollout_comparison(
+def evaluate_rollout(
     model: MeshGraphSimulator,
     datasets: list[dict],
     normalization: dict[str, float],
 ) -> dict[str, tuple[float, float]]:
-    """Compare GNN, zero-acceleration, and ground-truth-acceleration rollouts."""
     model.eval()
-    squared_error_sums = {"gnn": 0.0, "zero": 0.0, "oracle": 0.0}
-    final_squared_error_sums = {"gnn": 0.0, "zero": 0.0, "oracle": 0.0}
+    names = ("gnn", "zero")
+    squared_error_sums = {name: 0.0 for name in names}
+    final_squared_error_sums = {name: 0.0 for name in names}
     value_count = 0
     final_value_count = 0
 
     with torch.no_grad():
         for data in datasets:
             source = data["source"]
-            dt = max(source.dt, 1.0e-6)
             states = {
-                name: {
-                    "position": data["positions"][0].clone(),
-                    "velocity": data["velocities"][0].clone(),
-                }
-                for name in squared_error_sums
+                name: data["positions"][0].clone()
+                for name in names
             }
+            node_types = data["node_types"]
+            moving_mask = node_types == 0
 
             for frame in range(source.frame_count - 1):
-                target_position = data["positions"][frame + 1]
-                target_velocity = data["velocities"][frame + 1]
-                ground_truth_acceleration = (
-                    target_velocity - data["velocities"][frame]
-                ) / dt
+                target = data["positions"][frame + 1]
+                if "gnn" in states:
+                    delta, _ = model(
+                        data["rest"], states["gnn"], node_types,
+                        data["edges"], **normalization,
+                    )
+                    gnn_position = states["gnn"] + delta
+                    states["gnn"] = apply_known_boundary_positions(gnn_position, target, node_types)
 
-                accelerations = {
-                    "gnn": model(
-                        data["rest"],
-                        states["gnn"]["position"],
-                        states["gnn"]["velocity"],
-                        data["edges"],
-                        **normalization,
-                    ),
-                    "zero": torch.zeros_like(ground_truth_acceleration),
-                    "oracle": ground_truth_acceleration,
-                }
+                zero_position = states["zero"].clone()
+                states["zero"] = apply_known_boundary_positions(zero_position, target, node_types)
 
-                for name, acceleration in accelerations.items():
-                    state = states[name]
-                    state["velocity"] = state["velocity"] + acceleration * dt
-                    state["position"] = state["position"] + state["velocity"] * dt
-                    difference = state["position"] - target_position
-                    squared_error_sums[name] += torch.sum(
-                        difference * difference
-                    ).item()
-
+                for name in names:
+                    difference = states[name][moving_mask] - target[moving_mask]
+                    squared_error_sums[name] += torch.sum(difference * difference).item()
                     if frame == source.frame_count - 2:
-                        final_squared_error_sums[name] += torch.sum(
-                            difference * difference
-                        ).item()
+                        final_squared_error_sums[name] += torch.sum(difference * difference).item()
 
-                value_count += target_position.numel()
+                value_count += target[moving_mask].numel()
                 if frame == source.frame_count - 2:
-                    final_value_count += target_position.numel()
+                    final_value_count += target[moving_mask].numel()
 
     if value_count == 0 or final_value_count == 0:
-        return {
-            name: (float("nan"), float("nan"))
-            for name in squared_error_sums
-        }
-
+        return {name: (float("nan"), float("nan")) for name in names}
     return {
         name: (
             float(np.sqrt(squared_error_sums[name] / value_count)),
             float(np.sqrt(final_squared_error_sums[name] / final_value_count)),
         )
-        for name in squared_error_sums
+        for name in names
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train and evaluate a mesh-resolution-independent graph network."
+        description="Train a resolution-independent quasi-static DeformingPlate graph model."
     )
-    parser.add_argument("--data", type=Path, default=Path("data"))
-    parser.add_argument(
-        "--output", type=Path, default=Path("checkpoints/mesh_graph_simulator.pt")
-    )
+    parser.add_argument("--data", type=Path, required=True)
+    parser.add_argument("--validation-data", type=Path, default=None)
+    parser.add_argument("--output", type=Path, default=Path("checkpoints/deforming_plate_gnn.pt"))
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--steps-per-epoch", type=int, default=20)
     parser.add_argument("--rollout-horizon", type=int, default=8)
@@ -258,135 +227,100 @@ def main() -> None:
     parser.add_argument("--hidden-size", type=int, default=64)
     parser.add_argument("--message-passing-steps", type=int, default=3)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument("--validation-data", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--evaluation-interval", type=int, default=10,
-        help="Run full-trajectory validation every N epochs (also on the final epoch).",
-    )
+    parser.add_argument("--evaluation-interval", type=int, default=10)
     args = parser.parse_args()
 
+    if args.epochs < 1 or args.steps_per_epoch < 1 or args.rollout_horizon < 1:
+        raise SystemExit("--epochs, --steps-per-epoch and --rollout-horizon must be positive")
+    if args.evaluation_interval < 1:
+        raise SystemExit("--evaluation-interval must be positive")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA was requested, but is not available")
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
+    device = torch.device(
+        "cuda" if args.device == "auto" and torch.cuda.is_available()
+        else "cpu" if args.device == "auto" else args.device
+    )
 
     train_paths = sorted(args.data.glob("*.npds"))
     if not train_paths:
         raise SystemExit(f"No .npds files found in {args.data}")
-
     train_trajectories = [load_npds(path) for path in train_paths]
-    if args.validation_data:
+
+    validation_trajectories = []
+    if args.validation_data is not None:
         validation_paths = sorted(args.validation_data.glob("*.npds"))
         if not validation_paths:
             raise SystemExit(f"No validation .npds files found in {args.validation_data}")
         validation_trajectories = [load_npds(path) for path in validation_paths]
-    else:
-        validation_trajectories = []
 
     train_data = [prepare_trajectory(item, device) for item in train_trajectories]
     validation_data = [prepare_trajectory(item, device) for item in validation_trajectories]
-
+    evaluation_data = validation_data if validation_data else train_data
     normalization = compute_normalization(train_data)
+
+    print(f"Device: {device}")
+    print(f"Training trajectories: {len(train_data)}")
+    print("Training meshes: " + ", ".join(f"{item.vertex_count} vertices" for item in train_trajectories))
+    print(f"Validation trajectories: {len(validation_data)}")
     print(
-        "Normalization scales: "
-        f"length={normalization['length_scale']:.6e} "
-        f"velocity={normalization['velocity_scale']:.6e} "
-        f"acceleration={normalization['acceleration_scale']:.6e}"
+        "Normalization: "
+        f"length={normalization['length_scale']:.6e}, "
+        f"displacement={normalization['displacement_scale']:.6e}, "
+        f"stress={normalization['stress_scale']:.6e}"
     )
 
     model = MeshGraphSimulator(args.hidden_size, args.message_passing_steps).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
-
-    print(f"Device: {device}")
-    print(f"Training trajectories: {len(train_data)}")
-    print(
-        "Training meshes:",
-        ", ".join(f"{item.vertex_count} vertices" for item in train_trajectories),
-    )
-    if validation_data:
-        print(f"Validation trajectories: {len(validation_data)}")
-    else:
-        print("Validation disabled; best checkpoint will be selected on training data.")
-
-    if args.evaluation_interval < 1:
-        raise SystemExit("--evaluation-interval must be at least 1")
-
-    if args.rollout_horizon < 1:
-        raise SystemExit("--rollout-horizon must be at least 1")
-
     best_loss = float("inf")
     best_epoch = 0
     best_state = None
-    evaluation_data = validation_data if validation_data else train_data
 
     for epoch in range(args.epochs):
         model.train()
-        epoch_losses = []
-
+        losses = []
         for _ in range(args.steps_per_epoch):
             data = random.choice(train_data)
-            source = data["source"]
-            horizon = min(args.rollout_horizon, source.frame_count - 1)
-            start_frame = random.randrange(source.frame_count - horizon)
-            loss = compute_rollout_training_loss(
-                model,
-                data,
-                start_frame,
-                horizon,
-                normalization,
-            )
-
+            horizon = min(args.rollout_horizon, data["source"].frame_count - 1)
+            start_frame = random.randrange(data["source"].frame_count - horizon)
+            loss = compute_rollout_training_loss(model, data, start_frame, horizon, normalization)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            epoch_losses.append(loss.item())
+            losses.append(loss.item())
 
-        should_evaluate = (
-            (epoch + 1) % args.evaluation_interval == 0
-            or epoch + 1 == args.epochs
-        )
+        should_evaluate = (epoch + 1) % args.evaluation_interval == 0 or epoch + 1 == args.epochs
         if not should_evaluate:
-            print(
-                f"epoch {epoch + 1:04d} "
-                f"train_normalized={np.mean(epoch_losses):.6e} eval=skipped"
-            )
+            print(f"epoch {epoch + 1:04d} train={np.mean(losses):.6e} eval=skipped")
             continue
 
-        evaluation_loss, baseline_loss = evaluate_teacher_forced(
+        delta_mse, zero_delta_mse, stress_rmse = evaluate_teacher_forced(
             model, evaluation_data, normalization
         )
-        validation_rollout = evaluate_rollout_comparison(
-            model, evaluation_data, normalization
-        )
-        rollout_loss = validation_rollout["gnn"][0]
-        zero_rollout_loss = validation_rollout["zero"][0]
+        rollout_metrics = evaluate_rollout(model, evaluation_data, normalization)
+        rollout_rmse = rollout_metrics["gnn"][0]
         print(
-            f"epoch {epoch + 1:04d} "
-            f"train_normalized={np.mean(epoch_losses):.6e} "
-            f"eval={evaluation_loss:.6e} "
-            f"zero_baseline={baseline_loss:.6e} "
-            f"rollout_rmse={rollout_loss:.6e} "
-            f"zero_rollout_rmse={zero_rollout_loss:.6e}"
+            f"epoch {epoch + 1:04d} train={np.mean(losses):.6e} "
+            f"delta_mse={delta_mse:.6e} zero_delta_mse={zero_delta_mse:.6e} "
+            f"stress_rmse={stress_rmse:.6e} "
+            f"rollout_rmse={rollout_rmse:.6e} "
+            f"zero_rollout_rmse={rollout_metrics['zero'][0]:.6e}"
         )
-
-        if rollout_loss < best_loss:
-            best_loss = rollout_loss
+        if rollout_rmse < best_loss:
+            best_loss = rollout_rmse
             best_epoch = epoch + 1
             best_state = copy.deepcopy(model.state_dict())
 
     if best_state is None:
-        raise RuntimeError("Training did not produce a valid checkpoint")
-
+        raise RuntimeError("Training did not produce a checkpoint")
     model.load_state_dict(best_state)
-    rollout_metrics = evaluate_rollout_comparison(
+    final_metrics = evaluate_rollout(model, evaluation_data, normalization)
+    delta_mse, zero_delta_mse, stress_rmse = evaluate_teacher_forced(
         model, evaluation_data, normalization
     )
 
@@ -394,32 +328,31 @@ def main() -> None:
     torch.save(
         {
             "model_state_dict": best_state,
+            "model_kind": "deforming_plate_quasistatic",
             "hidden_size": args.hidden_size,
             "message_passing_steps": args.message_passing_steps,
-            "input_features": [
-                "position_minus_rest",
-                "velocity",
-                "rest_position",
-            ],
-            "output": "acceleration",
+            "input_features": ["position_minus_mesh_pos", "centered_mesh_pos", "node_type_one_hot"],
+            "outputs": ["world_pos_delta", "stress"],
+            "node_type_values": {"0": "moving", "1": "object", "3": "clamped"},
             "normalization": normalization,
             "best_epoch": best_epoch,
             "best_rollout_rmse": best_loss,
-            "rollout_metrics": rollout_metrics,
+            "rollout_metrics": final_metrics,
+            "teacher_forced_delta_mse": delta_mse,
+            "zero_delta_baseline_mse": zero_delta_mse,
+            "stress_rmse": stress_rmse,
             "seed": args.seed,
         },
         args.output,
     )
-
     print(f"Best epoch: {best_epoch}")
-    print(f"Best rollout RMSE: {best_loss:.6e}")
-    print(f"Zero-acceleration baseline MSE: {baseline_loss:.6e}")
-    for name, (all_frames_rmse, final_frame_rmse) in rollout_metrics.items():
-        print(
-            f"Rollout {name}: all_frames_rmse={all_frames_rmse:.6e} "
-            f"final_frame_rmse={final_frame_rmse:.6e}"
-        )
-    print(f"Saved best checkpoint: {args.output}")
+    print(f"Best moving-node rollout RMSE: {best_loss:.6e}")
+    print(f"Teacher-forced displacement MSE: {delta_mse:.6e}")
+    print(f"Zero-displacement baseline MSE: {zero_delta_mse:.6e}")
+    print(f"Teacher-forced stress RMSE: {stress_rmse:.6e}")
+    for name, (all_frames_rmse, final_frame_rmse) in final_metrics.items():
+        print(f"Rollout {name}: all_frames_rmse={all_frames_rmse:.6e} final_frame_rmse={final_frame_rmse:.6e}")
+    print(f"Saved checkpoint: {args.output}")
 
 
 if __name__ == "__main__":
