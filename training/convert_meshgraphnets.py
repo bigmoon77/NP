@@ -85,6 +85,7 @@ def write_npds(
     source_dataset: str,
     source_split: str,
     trajectory_index: int,
+    timestep_source: str,
 ) -> None:
     frame_count, vertex_count, _ = positions.shape
     velocities = np.zeros_like(positions, dtype=np.float32)
@@ -105,6 +106,7 @@ def write_npds(
         "edge_count": int(edges.shape[0]),
         "frame_count": frame_count,
         "capture_dt": float(dt),
+        "timestep_source": timestep_source,
         "source": "DeepMind MeshGraphNets",
         "source_dataset": source_dataset,
         "source_split": source_split,
@@ -138,6 +140,10 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--max-trajectories", type=int, default=8)
     parser.add_argument("--position-field", default="world_pos")
+    parser.add_argument(
+        "--timestep", type=float, default=1.0,
+        help="Fallback timestep when metadata has no physical timestep. Defaults to one frame unit.",
+    )
     args = parser.parse_args()
 
     metadata_path = args.input / "meta.json"
@@ -158,9 +164,19 @@ def main() -> None:
     if "cells" not in fields:
         raise SystemExit("MeshGraphNets metadata has no 'cells' feature")
 
-    dt = float(metadata.get("dt", 0.0))
-    if dt <= 0.0:
-        raise SystemExit(f"Invalid or missing timestep in metadata: dt={dt}")
+    metadata_dt = float(metadata.get("dt", 0.0))
+    if metadata_dt > 0.0:
+        dt = metadata_dt
+        timestep_source = "metadata"
+    else:
+        dt = args.timestep
+        timestep_source = "fallback_frame_unit"
+        if dt <= 0.0:
+            raise SystemExit(f"Fallback timestep must be positive, got {dt}")
+        print(
+            f"Metadata dt={metadata_dt}; using --timestep={dt} "
+            "as a normalized frame interval."
+        )
 
     description = {name: "byte" for name in metadata["field_names"]}
     output_dir = args.output or Path("data") / f"{metadata.get('dataset', 'deforming_plate')}_{args.split}"
@@ -203,6 +219,7 @@ def main() -> None:
             args.input.name,
             args.split,
             trajectory_index,
+            timestep_source,
         )
         converted_count += 1
         print(
