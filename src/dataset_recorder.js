@@ -12,6 +12,8 @@ let capturedFrames = [];
 let captureInterval = 6;
 let captureDt = 0;
 let simulationFrame = 0;
+let captureElapsed = 0;
+let capturedElapsed = 0;
 
 function buildEdges(geometry) {
   const index = geometry.index.array;
@@ -58,7 +60,10 @@ function captureFrame() {
   const vertexCount = simulation.geometry.attributes.position.count;
   const positions = readTarget(simulation.getPositionTarget(), vertexCount);
   const velocities = readTarget(simulation.getVelocityTarget(), vertexCount);
-  capturedFrames.push({ positions, velocities });
+  capturedFrames.push({ positions, velocities, elapsed: captureElapsed });
+  capturedElapsed += captureElapsed;
+  captureElapsed = 0;
+  captureDt = capturedFrames.length > 0 ? capturedElapsed / capturedFrames.length : captureDt;
   countElement.textContent = capturedFrames.length + " / " + targetFrames + " frames";
   if (capturedFrames.length >= targetFrames) {
     recording = false;
@@ -128,6 +133,8 @@ function startRecording() {
   targetFrames = Math.max(1, Math.floor(duration * 60 / captureInterval));
   captureDt = captureInterval / 60;
   frameCounter = 0;
+  captureElapsed = 0;
+  capturedElapsed = 0;
   recording = true;
   recordButton.disabled = true;
   downloadButton.disabled = true;
@@ -137,6 +144,7 @@ function startRecording() {
 
 function onAnimationFrame() {
   if (recording) {
+    captureElapsed += window.npSimulation ? window.npSimulation.getDelta() : 1 / 60;
     frameCounter += 1;
     if (frameCounter >= captureInterval) {
       frameCounter = 0;
