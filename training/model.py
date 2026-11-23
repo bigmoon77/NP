@@ -87,7 +87,8 @@ class MeshGraphSimulator(nn.Module):
         stress_scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         centered_rest = rest_positions - torch.mean(rest_positions, dim=0, keepdim=True)
-        type_features = F.one_hot(node_types.long(), num_classes=3).to(positions.dtype)
+        type_indices = torch.where(node_types == 3, 2, node_types).long()
+        type_features = F.one_hot(type_indices, num_classes=3).to(positions.dtype)
         features = torch.cat(
             ((positions - rest_positions) / length_scale, centered_rest / length_scale, type_features),
             dim=-1,
