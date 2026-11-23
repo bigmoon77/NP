@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 class MessagePassingBlock(nn.Module):
@@ -38,7 +39,6 @@ class MessagePassingBlock(nn.Module):
             (node_features[source], node_features[target], edge_features), dim=-1
         )
         messages = self.message_mlp(message_input)
-
         aggregate = torch.zeros_like(node_features)
         aggregate.index_add_(0, target, messages)
         degree = torch.zeros(
@@ -47,8 +47,7 @@ class MessagePassingBlock(nn.Module):
             device=node_features.device,
         )
         degree.index_add_(
-            0,
-            target,
+            0, target,
             torch.ones((target.shape[0], 1), dtype=node_features.dtype, device=node_features.device),
         )
         aggregate = aggregate / degree.clamp_min(1.0)
@@ -57,7 +56,7 @@ class MessagePassingBlock(nn.Module):
 
 
 class MeshGraphSimulator(nn.Module):
-    """A resolution-independent graph network predicting per-node acceleration."""
+    """Resolution-independent quasi-static graph model predicting displacement and stress."""
 
     def __init__(self, hidden_size: int = 64, message_passing_steps: int = 3) -> None:
         super().__init__()
@@ -72,7 +71,7 @@ class MeshGraphSimulator(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
-            nn.Linear(hidden_size, 3),
+            nn.Linear(hidden_size, 4),
         )
         nn.init.zeros_(self.decoder[-1].weight)
         nn.init.zeros_(self.decoder[-1].bias)
@@ -81,26 +80,22 @@ class MeshGraphSimulator(nn.Module):
         self,
         rest_positions: torch.Tensor,
         positions: torch.Tensor,
-        velocities: torch.Tensor,
+        node_types: torch.Tensor,
         edge_index: torch.Tensor,
         length_scale: float = 1.0,
-        velocity_scale: float = 1.0,
-        acceleration_scale: float = 1.0,
-    ) -> torch.Tensor:
-        centered_rest_positions = rest_positions - torch.mean(
-            rest_positions, dim=0, keepdim=True
-        )
+        displacement_scale: float = 1.0,
+        stress_scale: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        centered_rest = rest_positions - torch.mean(rest_positions, dim=0, keepdim=True)
+        type_features = F.one_hot(node_types.long(), num_classes=3).to(positions.dtype)
         features = torch.cat(
-            (
-                (positions - rest_positions) / length_scale,
-                velocities / velocity_scale,
-                centered_rest_positions / length_scale,
-            ),
+            ((positions - rest_positions) / length_scale, centered_rest / length_scale, type_features),
             dim=-1,
         )
         hidden = self.encoder(features)
         for block in self.blocks:
-            hidden = block(
-                hidden, positions, rest_positions, edge_index, length_scale
-            )
-        return self.decoder(hidden) * acceleration_scale
+            hidden = block(hidden, positions, rest_positions, edge_index, length_scale)
+        output = self.decoder(hidden)
+        displacement = output[:, :3] * displacement_scale
+        stress = output[:, 3] * stress_scale
+        return displacement, stress
