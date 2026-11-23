@@ -7,7 +7,8 @@ const durationSelect = document.querySelector("#capture-duration");
 
 let recording = false;
 let frameCounter = 0;
-let targetFrames = 0;
+let targetDuration = 0;
+let capturePeriod = 1 / 10;
 let capturedFrames = [];
 let captureInterval = 6;
 let captureDt = 0;
@@ -64,8 +65,8 @@ function captureFrame() {
   capturedElapsed += captureElapsed;
   captureElapsed = 0;
   captureDt = capturedFrames.length > 0 ? capturedElapsed / capturedFrames.length : captureDt;
-  countElement.textContent = capturedFrames.length + " / " + targetFrames + " frames";
-  if (capturedFrames.length >= targetFrames) {
+  countElement.textContent = capturedFrames.length + " frames · " + capturedElapsed.toFixed(1) + " s";
+  if (capturedElapsed >= targetDuration) {
     recording = false;
     recordButton.disabled = false;
     downloadButton.disabled = false;
@@ -130,8 +131,9 @@ function startRecording() {
   capturedFrames = [];
   captureInterval = Number(intervalSelect.value);
   const duration = Number(durationSelect.value);
-  targetFrames = Math.max(1, Math.floor(duration * 60 / captureInterval));
-  captureDt = captureInterval / 60;
+  targetDuration = duration;
+  capturePeriod = captureInterval / 60;
+  captureDt = capturePeriod;
   frameCounter = 0;
   captureElapsed = 0;
   capturedElapsed = 0;
@@ -139,15 +141,14 @@ function startRecording() {
   recordButton.disabled = true;
   downloadButton.disabled = true;
   statusElement.textContent = "Recording… avoid resetting during capture";
-  countElement.textContent = "0 / " + targetFrames + " frames";
+  countElement.textContent = "0 frames";
 }
 
 function onAnimationFrame() {
   if (recording) {
     captureElapsed += window.npSimulation ? window.npSimulation.getDelta() : 1 / 60;
     frameCounter += 1;
-    if (frameCounter >= captureInterval) {
-      frameCounter = 0;
+    if (captureElapsed >= capturePeriod) {
       captureFrame();
     }
   }
