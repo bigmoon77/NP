@@ -306,7 +306,7 @@ def main() -> None:
         if not should_evaluate:
             print(
                 f"epoch {epoch + 1:04d} "
-                f"train={np.mean(epoch_losses):.6e} eval=skipped"
+                f"train_normalized={np.mean(epoch_losses):.6e} eval=skipped"
             )
             continue
 
@@ -315,7 +315,7 @@ def main() -> None:
         )
         print(
             f"epoch {epoch + 1:04d} "
-            f"train={np.mean(epoch_losses):.6e} "
+            f"train_normalized={np.mean(epoch_losses):.6e} "
             f"eval={evaluation_loss:.6e} "
             f"zero_baseline={baseline_loss:.6e}"
         )
