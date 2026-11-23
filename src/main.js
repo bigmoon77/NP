@@ -101,8 +101,10 @@ function makeInitialTexture(geometry) {
   const positions = geometry.attributes.position.array;
   const data = texture.image.data;
   for (let index = 0; index < VERTEX_COUNT; index += 1) {
+    const row = Math.floor(index / TEXTURE_WIDTH);
+    const column = index - row * TEXTURE_WIDTH;
     const source = index * 3;
-    const target = index * 4;
+    const target = ((TEXTURE_HEIGHT - 1 - row) * TEXTURE_WIDTH + column) * 4;
     data[target] = positions[source];
     data[target + 1] = positions[source + 1];
     data[target + 2] = positions[source + 2];
