@@ -56,12 +56,14 @@ class MessagePassingBlock(nn.Module):
 
 
 class MeshGraphSimulator(nn.Module):
-    """Resolution-independent quasi-static graph model predicting displacement and stress."""
+    """Resolution-independent quasi-static graph model predicting vertex displacement."""
 
     def __init__(self, hidden_size: int = 64, message_passing_steps: int = 3) -> None:
         super().__init__()
+        # Deformation (3), centered rest position (3), prescribed motion (3),
+        # and node type one-hot (3).
         self.encoder = nn.Sequential(
-            nn.Linear(9, hidden_size),
+            nn.Linear(12, hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size),
         )
@@ -71,7 +73,7 @@ class MeshGraphSimulator(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
-            nn.Linear(hidden_size, 4),
+            nn.Linear(hidden_size, 3),
         )
         nn.init.zeros_(self.decoder[-1].weight)
         nn.init.zeros_(self.decoder[-1].bias)
@@ -82,21 +84,26 @@ class MeshGraphSimulator(nn.Module):
         positions: torch.Tensor,
         node_types: torch.Tensor,
         edge_index: torch.Tensor,
+        prescribed_motion: torch.Tensor | None = None,
         length_scale: float = 1.0,
         displacement_scale: float = 1.0,
-        stress_scale: float = 1.0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         centered_rest = rest_positions - torch.mean(rest_positions, dim=0, keepdim=True)
         type_indices = torch.where(node_types == 3, 2, node_types).long()
         type_features = F.one_hot(type_indices, num_classes=3).to(positions.dtype)
+        if prescribed_motion is None:
+            prescribed_motion = torch.zeros_like(positions)
+
         features = torch.cat(
-            ((positions - rest_positions) / displacement_scale, centered_rest / length_scale, type_features),
+            (
+                (positions - rest_positions) / displacement_scale,
+                centered_rest / length_scale,
+                prescribed_motion / displacement_scale,
+                type_features,
+            ),
             dim=-1,
         )
         hidden = self.encoder(features)
         for block in self.blocks:
             hidden = block(hidden, positions, rest_positions, edge_index, length_scale)
-        output = self.decoder(hidden)
-        displacement = output[:, :3] * displacement_scale
-        stress = output[:, 3] * stress_scale
-        return displacement, stress
+        return self.decoder(hidden) * displacement_scale
