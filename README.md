@@ -42,7 +42,7 @@ The browser recorder exports `.npds` binary trajectory files. Version 1 stores a
 2. Undirected triangle edges: uint32 [E, 2]
 3. For each frame: positions float32 [N, 3], then velocities float32 [N, 3]
 
-The file starts with the 8-byte magic `NPDS0001`, followed by a uint32 little-endian JSON-header byte length. Captures are sampled at 10, 20, or 30 Hz. The current sphere is the first data-generation source; use different meshes and material settings in later dataset-generation milestones to test cross-mesh generalization.
+The file starts with the 8-byte magic `NPDS0001`, followed by a uint32 little-endian JSON-header byte length. Captures are sampled at 10, 20, or 30 Hz. The default is a 2-second capture because 100k-node float32 trajectories create large files (about 2.4 MB per frame). The current sphere is the first data-generation source; use different meshes and material settings in later dataset-generation milestones to test cross-mesh generalization.
 
 ## Train the first graph-network baseline
 
