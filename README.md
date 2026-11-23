@@ -71,6 +71,34 @@ python training/train.py --data data/train --validation-data data/validation
 
 The prototype is a resolution-independent message-passing network: node count is not fixed in the model. It predicts per-vertex acceleration from deformation, velocity, rest position, and mesh adjacency. This is an initial research baseline, not yet a robust general-purpose material model. Current capture UI produces the sphere reference trajectory; collect additional shapes before interpreting validation results as cross-shape generalization.
 
+
+## Import the public MeshGraphNets dataset
+
+The first external-data experiment uses DeepMind's `deforming_plate` structural-mechanics trajectories. The source files are official TFRecords; the importer converts each trajectory into the NPDS format already used by this project. TensorFlow is not required.
+
+Download the official dataset (all splits):
+
+```powershell
+.\.venv\Scripts\python.exe training/download_meshgraphnets.py --dataset deforming_plate --split all
+```
+
+Convert a small starter subset (8 trajectories by default):
+
+```powershell
+.\.venv\Scripts\python.exe training/convert_meshgraphnets.py --input data/meshgraphnets/deforming_plate --split train --max-trajectories 8 --output data/deforming_plate_train
+.\.venv\Scripts\python.exe training/convert_meshgraphnets.py --input data/meshgraphnets/deforming_plate --split valid --max-trajectories 2 --output data/deforming_plate_valid
+```
+
+Train and validate:
+
+```powershell
+.\.venv\Scripts\python.exe training/train.py --data data/deforming_plate_train --validation-data data/deforming_plate_valid --epochs 100
+```
+
+Use `--max-trajectories 0` to convert every trajectory in a split. The converter currently imports fixed-topology triangle meshes and position trajectories. Two-dimensional coordinates are padded with a zero Z coordinate. It derives velocity from consecutive positions and the dataset timestep. The DeformingPlate benchmark is structural mechanics data, not a general 3D soft-body dataset; it is used here to validate the public-data ingestion and training pipeline.
+
+Source: https://github.com/google-deepmind/deepmind-research/tree/master/meshgraphnets
+
 ## Roadmap
 
 1. GPU reference solver and interactive 100k-vertex demo
