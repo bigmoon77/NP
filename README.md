@@ -44,6 +44,33 @@ The browser recorder exports `.npds` binary trajectory files. Version 1 stores a
 
 The file starts with the 8-byte magic `NPDS0001`, followed by a uint32 little-endian JSON-header byte length. Captures are sampled at 10, 20, or 30 Hz. The current sphere is the first data-generation source; use different meshes and material settings in later dataset-generation milestones to test cross-mesh generalization.
 
+## Train the first graph-network baseline
+
+Install the Python dependencies:
+
+```bash
+python -m venv .venv
+# Windows PowerShell:
+.venv\\Scripts\\Activate.ps1
+# Linux/macOS:
+# source .venv/bin/activate
+pip install -r training/requirements.txt
+```
+
+Put one or more downloaded `.npds` files in `data/`, then run:
+
+```bash
+python training/train.py --data data --epochs 100
+```
+
+For a meaningful cross-mesh generalization measurement, put trajectories from entirely different held-out shapes in `validation/` and run:
+
+```bash
+python training/train.py --data data/train --validation-data data/validation
+```
+
+The prototype is a resolution-independent message-passing network: node count is not fixed in the model. It predicts per-vertex acceleration from deformation, velocity, rest position, and mesh adjacency. This is an initial research baseline, not yet a robust general-purpose material model. Current capture UI produces the sphere reference trajectory; collect additional shapes before interpreting validation results as cross-shape generalization.
+
 ## Roadmap
 
 1. GPU reference solver and interactive 100k-vertex demo
