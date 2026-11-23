@@ -76,6 +76,60 @@ def compute_normalization(data_list: list[dict]) -> dict[str, float]:
     }
 
 
+
+def compute_rollout_training_loss(
+    model: MeshGraphSimulator,
+    data: dict,
+    start_frame: int,
+    horizon: int,
+    normalization: dict[str, float],
+) -> torch.Tensor:
+    """Train through a differentiable multi-step simulation rollout."""
+    source = data["source"]
+    dt = max(source.dt, 1.0e-6)
+    position = data["positions"][start_frame]
+    velocity = data["velocities"][start_frame]
+    step_losses = []
+
+    for step in range(horizon):
+        frame = start_frame + step
+        target_position = data["positions"][frame + 1]
+        target_velocity = data["velocities"][frame + 1]
+        target_acceleration = (
+            target_velocity - data["velocities"][frame]
+        ) / dt
+
+        acceleration = model(
+            data["rest"],
+            position,
+            velocity,
+            data["edges"],
+            **normalization,
+        )
+        velocity = velocity + acceleration * dt
+        position = position + velocity * dt
+
+        acceleration_loss = F.mse_loss(
+            acceleration / normalization["acceleration_scale"],
+            target_acceleration / normalization["acceleration_scale"],
+        )
+        velocity_loss = F.mse_loss(
+            velocity / normalization["velocity_scale"],
+            target_velocity / normalization["velocity_scale"],
+        )
+        position_loss = F.mse_loss(
+            (position - target_position) / normalization["length_scale"],
+            torch.zeros_like(target_position),
+        )
+        step_losses.append(
+            0.10 * acceleration_loss
+            + 0.25 * velocity_loss
+            + position_loss
+        )
+
+    return torch.stack(step_losses).mean()
+
+
 def evaluate_teacher_forced(
     model: MeshGraphSimulator,
     datasets: list[dict],
@@ -199,6 +253,7 @@ def main() -> None:
     )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--steps-per-epoch", type=int, default=20)
+    parser.add_argument("--rollout-horizon", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
     parser.add_argument("--hidden-size", type=int, default=64)
     parser.add_argument("--message-passing-steps", type=int, default=3)
@@ -263,6 +318,9 @@ def main() -> None:
     if args.evaluation_interval < 1:
         raise SystemExit("--evaluation-interval must be at least 1")
 
+    if args.rollout_horizon < 1:
+        raise SystemExit("--rollout-horizon must be at least 1")
+
     best_loss = float("inf")
     best_epoch = 0
     best_state = None
@@ -275,22 +333,14 @@ def main() -> None:
         for _ in range(args.steps_per_epoch):
             data = random.choice(train_data)
             source = data["source"]
-            frame = random.randrange(source.frame_count - 1)
-            dt = max(source.dt, 1.0e-6)
-
-            prediction = model(
-                data["rest"],
-                data["positions"][frame],
-                data["velocities"][frame],
-                data["edges"],
-                **normalization,
-            )
-            target = (
-                data["velocities"][frame + 1] - data["velocities"][frame]
-            ) / dt
-            loss = F.mse_loss(
-                prediction / normalization["acceleration_scale"],
-                target / normalization["acceleration_scale"],
+            horizon = min(args.rollout_horizon, source.frame_count - 1)
+            start_frame = random.randrange(source.frame_count - horizon)
+            loss = compute_rollout_training_loss(
+                model,
+                data,
+                start_frame,
+                horizon,
+                normalization,
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -313,15 +363,22 @@ def main() -> None:
         evaluation_loss, baseline_loss = evaluate_teacher_forced(
             model, evaluation_data, normalization
         )
+        validation_rollout = evaluate_rollout_comparison(
+            model, evaluation_data, normalization
+        )
+        rollout_loss = validation_rollout["gnn"][0]
+        zero_rollout_loss = validation_rollout["zero"][0]
         print(
             f"epoch {epoch + 1:04d} "
             f"train_normalized={np.mean(epoch_losses):.6e} "
             f"eval={evaluation_loss:.6e} "
-            f"zero_baseline={baseline_loss:.6e}"
+            f"zero_baseline={baseline_loss:.6e} "
+            f"rollout_rmse={rollout_loss:.6e} "
+            f"zero_rollout_rmse={zero_rollout_loss:.6e}"
         )
 
-        if evaluation_loss < best_loss:
-            best_loss = evaluation_loss
+        if rollout_loss < best_loss:
+            best_loss = rollout_loss
             best_epoch = epoch + 1
             best_state = copy.deepcopy(model.state_dict())
 
@@ -355,7 +412,7 @@ def main() -> None:
     )
 
     print(f"Best epoch: {best_epoch}")
-    print(f"Best evaluation MSE: {best_loss:.6e}")
+    print(f"Best rollout RMSE: {best_loss:.6e}")
     print(f"Zero-acceleration baseline MSE: {baseline_loss:.6e}")
     for name, (all_frames_rmse, final_frame_rmse) in rollout_metrics.items():
         print(
