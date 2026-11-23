@@ -67,14 +67,14 @@ def evaluate_teacher_forced(
     return squared_error_sum / value_count, baseline_error_sum / value_count
 
 
-def evaluate_rollout(
+def evaluate_rollout_comparison(
     model: MeshGraphSimulator,
     datasets: list[dict],
-) -> tuple[float, float]:
-    """Autoregressively integrate predicted acceleration across each trajectory."""
+) -> dict[str, tuple[float, float]]:
+    """Compare GNN, zero-acceleration, and ground-truth-acceleration rollouts."""
     model.eval()
-    squared_error_sum = 0.0
-    final_squared_error_sum = 0.0
+    squared_error_sums = {"gnn": 0.0, "zero": 0.0, "oracle": 0.0}
+    final_squared_error_sums = {"gnn": 0.0, "zero": 0.0, "oracle": 0.0}
     value_count = 0
     final_value_count = 0
 
@@ -82,36 +82,63 @@ def evaluate_rollout(
         for data in datasets:
             source = data["source"]
             dt = max(source.dt, 1.0e-6)
-            predicted_position = data["positions"][0].clone()
-            predicted_velocity = data["velocities"][0].clone()
+            states = {
+                name: {
+                    "position": data["positions"][0].clone(),
+                    "velocity": data["velocities"][0].clone(),
+                }
+                for name in squared_error_sums
+            }
 
             for frame in range(source.frame_count - 1):
-                acceleration = model(
-                    data["rest"],
-                    predicted_position,
-                    predicted_velocity,
-                    data["edges"],
-                )
-                predicted_velocity = predicted_velocity + acceleration * dt
-                predicted_position = predicted_position + predicted_velocity * dt
-
                 target_position = data["positions"][frame + 1]
-                difference = predicted_position - target_position
-                squared_error_sum += torch.sum(difference * difference).item()
-                value_count += difference.numel()
+                target_velocity = data["velocities"][frame + 1]
+                ground_truth_acceleration = (
+                    target_velocity - data["velocities"][frame]
+                ) / dt
 
-                if frame == source.frame_count - 2:
-                    final_squared_error_sum += torch.sum(
+                accelerations = {
+                    "gnn": model(
+                        data["rest"],
+                        states["gnn"]["position"],
+                        states["gnn"]["velocity"],
+                        data["edges"],
+                    ),
+                    "zero": torch.zeros_like(ground_truth_acceleration),
+                    "oracle": ground_truth_acceleration,
+                }
+
+                for name, acceleration in accelerations.items():
+                    state = states[name]
+                    state["velocity"] = state["velocity"] + acceleration * dt
+                    state["position"] = state["position"] + state["velocity"] * dt
+                    difference = state["position"] - target_position
+                    squared_error_sums[name] += torch.sum(
                         difference * difference
                     ).item()
-                    final_value_count += difference.numel()
+
+                    if frame == source.frame_count - 2:
+                        final_squared_error_sums[name] += torch.sum(
+                            difference * difference
+                        ).item()
+
+                value_count += target_position.numel()
+                if frame == source.frame_count - 2:
+                    final_value_count += target_position.numel()
 
     if value_count == 0 or final_value_count == 0:
-        return float("nan"), float("nan")
-    return (
-        float(np.sqrt(squared_error_sum / value_count)),
-        float(np.sqrt(final_squared_error_sum / final_value_count)),
-    )
+        return {
+            name: (float("nan"), float("nan"))
+            for name in squared_error_sums
+        }
+
+    return {
+        name: (
+            float(np.sqrt(squared_error_sums[name] / value_count)),
+            float(np.sqrt(final_squared_error_sums[name] / final_value_count)),
+        )
+        for name in squared_error_sums
+    }
 
 
 def main() -> None:
@@ -242,7 +269,7 @@ def main() -> None:
         raise RuntimeError("Training did not produce a valid checkpoint")
 
     model.load_state_dict(best_state)
-    rollout_rmse, final_rollout_rmse = evaluate_rollout(model, evaluation_data)
+    rollout_metrics = evaluate_rollout_comparison(model, evaluation_data)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -258,8 +285,7 @@ def main() -> None:
             "output": "acceleration",
             "best_epoch": best_epoch,
             "best_evaluation_mse": best_loss,
-            "rollout_position_rmse": rollout_rmse,
-            "final_rollout_position_rmse": final_rollout_rmse,
+            "rollout_metrics": rollout_metrics,
             "seed": args.seed,
         },
         args.output,
@@ -268,8 +294,11 @@ def main() -> None:
     print(f"Best epoch: {best_epoch}")
     print(f"Best evaluation MSE: {best_loss:.6e}")
     print(f"Zero-acceleration baseline MSE: {baseline_loss:.6e}")
-    print(f"Rollout position RMSE (all frames): {rollout_rmse:.6e}")
-    print(f"Rollout position RMSE (final frame): {final_rollout_rmse:.6e}")
+    for name, (all_frames_rmse, final_frame_rmse) in rollout_metrics.items():
+        print(
+            f"Rollout {name}: all_frames_rmse={all_frames_rmse:.6e} "
+            f"final_frame_rmse={final_frame_rmse:.6e}"
+        )
     print(f"Saved best checkpoint: {args.output}")
 
 
