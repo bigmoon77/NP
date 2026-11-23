@@ -95,6 +95,8 @@ Train and validate:
 .\.venv\Scripts\python.exe training/train.py --data data/deforming_plate_train --validation-data data/deforming_plate_valid --epochs 100
 ```
 
+The trainer evaluates every frame transition in the selected evaluation split (rather than only the final transition). Full evaluation runs every 10 epochs by default and always runs on the final epoch; change this with `--evaluation-interval`. It reports acceleration MSE alongside a zero-acceleration baseline, selects and saves the best checkpoint by full-trajectory evaluation MSE, then reports autoregressive rollout position RMSE over all frames and at the final frame. The rollout starts from the ground-truth first frame and thereafter uses only model-predicted accelerations.
+
 Use `--max-trajectories 0` to convert every trajectory in a split. The converter currently imports fixed-topology triangle or tetrahedral meshes and position trajectories. Two-dimensional coordinates are padded with a zero Z coordinate. It derives velocity from consecutive positions. If the metadata provides a positive physical timestep, that value is used; otherwise the importer uses `--timestep 1.0` (one normalized frame interval). DeformingPlate does not provide a usable physical `dt`, so the fallback keeps derivatives in frame-based units; it does not recover physical seconds. The DeformingPlate benchmark is structural mechanics data, not a general 3D soft-body dataset; it is used here to validate the public-data ingestion and training pipeline.
 
 Source: https://github.com/google-deepmind/deepmind-research/tree/master/meshgraphnets
