@@ -6,11 +6,11 @@ A browser-based research sandbox for comparing conventional soft-body simulation
 
 The first milestone is a GPU-driven, approximately 100k-vertex deformable sphere. Drag the sphere surface with the pointer, release it, and observe its elastic recovery.
 
-> The initial backend is a conventional GPU spring/shape-restoration solver. It is a reference simulator and data-generation baseline, not a trained neural model. The project is structured so a learned GNS-style backend can be added and compared against it.
+> The browser demo currently uses a conventional GPU spring/shape-restoration solver. It is a reference simulator and data-generation baseline, not a trained neural model.
 
-## Run
+## Run the browser demo
 
-Open `index.html` through a local static HTTP server (WebGL2 is required). For example:
+Open `index.html` through a local static HTTP server (WebGL2 is required):
 
 ```bash
 python -m http.server 8000
@@ -33,6 +33,62 @@ Then visit http://localhost:8000.
 - Particle state is stored in floating-point textures
 - Spring interactions use the four parametric grid neighbors
 - A shape-restoration term helps preserve the spherical rest shape
+
+## Dataset formats
+
+The browser recorder currently exports NPDS v1. Its binary payload stores rest positions, undirected mesh edges, then per-frame positions and velocities. The file starts with the 8-byte magic `NPDS0001` and a uint32 little-endian JSON-header length.
+
+The MeshGraphNets DeformingPlate importer writes NPDS v2. It stores:
+
+1. Reference mesh positions: float32 [N, 3]
+2. Undirected tetrahedral mesh edges: uint32 [E, 2]
+3. Node types: int32 [N]
+4. Per frame: world positions float32 [N, 3], then stress float32 [N]
+
+NPDS v2 uses the magic `NPDS0002`. The reader supports both versions. V1 remains the browser-capture format; V2 preserves structural-mechanics features that cannot be represented by the old position/velocity-only layout.
+
+## Python setup
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r training/requirements.txt
+```
+
+## DeformingPlate experiment
+
+This experiment uses the public DeepMind MeshGraphNets DeformingPlate dataset. Download the TFRecords (TensorFlow is not required by the converter):
+
+```powershell
+.\.venv\Scripts\python.exe training/download_meshgraphnets.py --dataset deforming_plate --split all
+```
+
+Convert a starter subset:
+
+```powershell
+.\.venv\Scripts\python.exe training/convert_meshgraphnets.py --input data/meshgraphnets/deforming_plate --split train --max-trajectories 8 --output data/deforming_plate_train
+.\.venv\Scripts\python.exe training/convert_meshgraphnets.py --input data/meshgraphnets/deforming_plate --split valid --max-trajectories 2 --output data/deforming_plate_valid
+```
+
+Train:
+
+```powershell
+.\.venv\Scripts\python.exe training/train.py --data data/deforming_plate_train --validation-data data/deforming_plate_valid --epochs 100
+```
+
+### Model and boundary conditions
+
+DeformingPlate metadata has `dt=0`; its frames are structural states, not samples at a physical time interval. The importer therefore does not derive physical velocity or acceleration and does not apply a fallback timestep.
+
+The model predicts next-frame vertex displacement. Node type is encoded as a three-class one-hot feature (raw values 0, 1, and 3). The two constrained classes (1 and 3) are overwritten with their exact next-frame positions during training and evaluation. Their known next-frame displacement is also supplied to the network as a prescribed-boundary-motion feature, allowing the model to observe the imposed deformation that drives the unconstrained vertices. The network learns the moving vertices (type 0); its displacement loss and rollout metrics are reported on those vertices.
+
+Stress remains preserved in NPDS v2 for future experiments, but this training stage excludes stress prediction and its loss so geometry learning can be evaluated independently. The trainer uses differentiable autoregressive rollouts, evaluates the complete validation trajectories at the configured interval, and selects the checkpoint by moving-node rollout RMSE. It reports a zero-displacement baseline and teacher-forced displacement MSE. The baseline applies the same exact boundary conditions, so the comparison measures what the learned model adds on unconstrained vertices.
+
+The prescribed-boundary-motion input uses the known displacement of node types 1 and 3 for the current frame transition and zero for moving nodes. During autoregressive rollout, the same known boundary information is taken from the corresponding next frame in the dataset. This is a supervised offline experiment; runtime deployment must provide equivalent boundary-condition input.
+
+If the converter or NPDS layout changes, regenerate the dataset files before training. In particular, existing NPDS v1 files do not contain the required DeformingPlate node types or stress values.
+
+Source: https://github.com/google-deepmind/deepmind-research/tree/master/meshgraphnets
 
 ## Roadmap
 

@@ -65,6 +65,21 @@
         <input id="grab-strength" type="range" min="10" max="220" value="85" step="1">
         <p>How strongly nearby particles follow the pointer</p>
       </div>
+      <div class="dataset-control">
+        <div class="eyebrow">DATASET CAPTURE</div>
+        <div class="dataset-row">
+          <label for="capture-interval">Capture interval</label>
+          <select id="capture-interval"><option value="6">10 Hz</option><option value="3">20 Hz</option><option value="2">30 Hz</option></select>
+        </div>
+        <div class="dataset-row">
+          <label for="capture-duration">Duration</label>
+          <select id="capture-duration"><option value="2" selected>2 seconds</option><option value="5">5 seconds</option><option value="10">10 seconds</option></select>
+        </div>
+        <div class="dataset-row"><span id="capture-status">Ready to record</span><strong id="capture-count">0 frames</strong></div>
+        <button id="record" class="primary">Record trajectory</button>
+        <button id="download-dataset" disabled>Download .npds</button>
+        <p>Records positions and velocities for every vertex, plus rest shape and mesh edges.</p>
+      </div>
       <button id="reset" class="primary">Reset sphere</button>
       <div class="divider"></div>
       <div class="info-block">
@@ -80,5 +95,6 @@
     </aside>
   </main>
   <script type="module" src="./src/main.js"></script>
+  <script type="module" src="./src/dataset_recorder.js"></script>
 </body>
 </html>

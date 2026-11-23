@@ -352,6 +352,14 @@ async function initialize() {
     const material = createSurfaceMaterial(startTexture);
     mesh = new THREE.Mesh(geometry, material);
     scene.add(mesh);
+    window.npSimulation = {
+      renderer,
+      geometry,
+      getPositionTarget: () => gpuCompute.getCurrentRenderTarget(positionVariable),
+      getVelocityTarget: () => gpuCompute.getCurrentRenderTarget(velocityVariable),
+      getDelta: () => positionVariable.material.uniforms.delta.value,
+      getIsGrabbing: () => isGrabbing
+    };
 
     const grid = new THREE.GridHelper(8, 24, 0x263d50, 0x172838);
     grid.position.y = -1.25;
