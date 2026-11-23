@@ -61,15 +61,27 @@ def as_xyz(positions: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(positions, dtype=np.float32)
 
 
-def triangles_to_edges(cells: np.ndarray, vertex_count: int) -> np.ndarray:
-    triangles = np.asarray(cells, dtype=np.int64).reshape(-1, 3)
-    if triangles.size == 0:
-        raise ValueError("The trajectory contains no triangle cells")
-    if int(triangles.min()) < 0 or int(triangles.max()) >= vertex_count:
-        raise ValueError("Triangle cell index is outside the vertex range")
+def cells_to_edges(cells: np.ndarray, vertex_count: int) -> np.ndarray:
+    cells = np.asarray(cells, dtype=np.int64)
+    if cells.ndim != 2 or cells.shape[1] not in (3, 4):
+        raise ValueError(
+            f"Expected triangle or tetrahedron cells [count, 3|4], got {cells.shape}"
+        )
+    if cells.size == 0:
+        raise ValueError("The trajectory contains no mesh cells")
+    if int(cells.min()) < 0 or int(cells.max()) >= vertex_count:
+        raise ValueError("Mesh cell index is outside the vertex range")
+
+    if cells.shape[1] == 3:
+        local_edges = ((0, 1), (1, 2), (2, 0))
+    else:
+        local_edges = (
+            (0, 1), (0, 2), (0, 3),
+            (1, 2), (1, 3), (2, 3),
+        )
 
     edge_parts = np.concatenate(
-        (triangles[:, (0, 1)], triangles[:, (1, 2)], triangles[:, (2, 0)]),
+        [cells[:, edge] for edge in local_edges],
         axis=0,
     )
     edges = np.sort(edge_parts, axis=1)
@@ -207,9 +219,7 @@ def main() -> None:
                     "This NPDS importer requires fixed topology, but cells change over time"
                 )
             cells = cells[0]
-        if cells.ndim != 2 or cells.shape[-1] != 3:
-            raise ValueError(f"Expected triangle cells [faces, 3], got {cells.shape}")
-        edges = triangles_to_edges(cells, positions.shape[1])
+        edges = cells_to_edges(cells, positions.shape[1])
         output_path = output_dir / f"trajectory_{trajectory_index:05d}.npds"
         write_npds(
             output_path,
