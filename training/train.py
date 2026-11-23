@@ -106,7 +106,7 @@ def compute_rollout_training_loss(
         position = apply_known_boundary_positions(predicted_position, target_position, node_types)
 
         position_loss = F.mse_loss(
-            (position[moving_mask] - target_position[moving_mask]) / normalization["length_scale"],
+            (position[moving_mask] - target_position[moving_mask]) / normalization["displacement_scale"],
             torch.zeros_like(target_position[moving_mask]),
         )
         stress_loss = F.mse_loss(
