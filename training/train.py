@@ -404,7 +404,7 @@ def main() -> None:
             "output": "acceleration",
             "normalization": normalization,
             "best_epoch": best_epoch,
-            "best_evaluation_mse": best_loss,
+            "best_rollout_rmse": best_loss,
             "rollout_metrics": rollout_metrics,
             "seed": args.seed,
         },
