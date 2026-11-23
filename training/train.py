@@ -32,9 +32,54 @@ def prepare_trajectory(trajectory: Trajectory, device: torch.device) -> dict:
     }
 
 
+
+def compute_normalization(data_list: list[dict]) -> dict[str, float]:
+    """Compute global physical scales from training trajectories only."""
+    edge_squared_sum = 0.0
+    edge_count = 0
+    velocity_squared_sum = 0.0
+    velocity_count = 0
+    acceleration_squared_sum = 0.0
+    acceleration_count = 0
+
+    for data in data_list:
+        source = data["source"]
+        rest = data["rest"]
+        edges = data["edges"]
+        edge_delta = rest[edges[0]] - rest[edges[1]]
+        edge_squared_sum += torch.sum(edge_delta * edge_delta).item()
+        edge_count += edge_delta.shape[0]
+
+        velocities = data["velocities"]
+        velocity_squared_sum += torch.sum(velocities * velocities).item()
+        velocity_count += velocities.numel()
+
+        dt = max(source.dt, 1.0e-6)
+        accelerations = (velocities[1:] - velocities[:-1]) / dt
+        acceleration_squared_sum += torch.sum(
+            accelerations * accelerations
+        ).item()
+        acceleration_count += accelerations.numel()
+
+    length_scale = float(np.sqrt(edge_squared_sum / max(edge_count, 1)))
+    velocity_scale = float(np.sqrt(velocity_squared_sum / max(velocity_count, 1)))
+    acceleration_scale = float(
+        np.sqrt(acceleration_squared_sum / max(acceleration_count, 1))
+    )
+
+    return {
+        "length_scale": max(length_scale, 1.0e-8),
+        "velocity_scale": max(velocity_scale, max(length_scale, 1.0e-8) * 1.0e-6),
+        "acceleration_scale": max(
+            acceleration_scale, max(length_scale, 1.0e-8) * 1.0e-8
+        ),
+    }
+
+
 def evaluate_teacher_forced(
     model: MeshGraphSimulator,
     datasets: list[dict],
+    normalization: dict[str, float],
 ) -> tuple[float, float]:
     """Evaluate every consecutive frame pair and a zero-acceleration baseline."""
     model.eval()
@@ -55,6 +100,7 @@ def evaluate_teacher_forced(
                     data["positions"][frame],
                     data["velocities"][frame],
                     data["edges"],
+                    **normalization,
                 )
                 squared_error_sum += F.mse_loss(
                     predicted, target, reduction="sum"
@@ -70,6 +116,7 @@ def evaluate_teacher_forced(
 def evaluate_rollout_comparison(
     model: MeshGraphSimulator,
     datasets: list[dict],
+    normalization: dict[str, float],
 ) -> dict[str, tuple[float, float]]:
     """Compare GNN, zero-acceleration, and ground-truth-acceleration rollouts."""
     model.eval()
@@ -103,6 +150,7 @@ def evaluate_rollout_comparison(
                         states["gnn"]["position"],
                         states["gnn"]["velocity"],
                         data["edges"],
+                        **normalization,
                     ),
                     "zero": torch.zeros_like(ground_truth_acceleration),
                     "oracle": ground_truth_acceleration,
@@ -190,6 +238,14 @@ def main() -> None:
     train_data = [prepare_trajectory(item, device) for item in train_trajectories]
     validation_data = [prepare_trajectory(item, device) for item in validation_trajectories]
 
+    normalization = compute_normalization(train_data)
+    print(
+        "Normalization scales: "
+        f"length={normalization['length_scale']:.6e} "
+        f"velocity={normalization['velocity_scale']:.6e} "
+        f"acceleration={normalization['acceleration_scale']:.6e}"
+    )
+
     model = MeshGraphSimulator(args.hidden_size, args.message_passing_steps).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 
@@ -227,11 +283,15 @@ def main() -> None:
                 data["positions"][frame],
                 data["velocities"][frame],
                 data["edges"],
+                **normalization,
             )
             target = (
                 data["velocities"][frame + 1] - data["velocities"][frame]
             ) / dt
-            loss = F.mse_loss(prediction, target)
+            loss = F.mse_loss(
+                prediction / normalization["acceleration_scale"],
+                target / normalization["acceleration_scale"],
+            )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -251,7 +311,7 @@ def main() -> None:
             continue
 
         evaluation_loss, baseline_loss = evaluate_teacher_forced(
-            model, evaluation_data
+            model, evaluation_data, normalization
         )
         print(
             f"epoch {epoch + 1:04d} "
@@ -269,7 +329,9 @@ def main() -> None:
         raise RuntimeError("Training did not produce a valid checkpoint")
 
     model.load_state_dict(best_state)
-    rollout_metrics = evaluate_rollout_comparison(model, evaluation_data)
+    rollout_metrics = evaluate_rollout_comparison(
+        model, evaluation_data, normalization
+    )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -283,6 +345,7 @@ def main() -> None:
                 "rest_position",
             ],
             "output": "acceleration",
+            "normalization": normalization,
             "best_epoch": best_epoch,
             "best_evaluation_mse": best_loss,
             "rollout_metrics": rollout_metrics,
