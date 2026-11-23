@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>NP — Soft-body Sphere</title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <main id="app">
+    <section class="viewport">
+      <canvas id="view"></canvas>
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">NEURAL PHYSICS SANDBOX</div>
+          <h1>Soft-body sphere</h1>
+          <p>GPU reference solver · interactive surface manipulation</p>
+        </div>
+        <div class="status"><span class="status-dot"></span><span id="backend-status">Initializing WebGL2…</span></div>
+      </header>
+      <div class="hint" id="hint">Drag the sphere to pull its surface · Orbit when not dragging</div>
+      <div class="error-panel" id="error-panel" hidden></div>
+    </section>
+    <aside class="panel">
+      <div class="panel-heading">
+        <div class="eyebrow">SIMULATION</div>
+        <h2>Experiment controls</h2>
+      </div>
+      <div class="metric-grid">
+        <div class="metric"><span>VERTICES</span><strong id="vertex-count">—</strong></div>
+        <div class="metric"><span>FPS</span><strong id="fps">—</strong></div>
+        <div class="metric"><span>GPU STEP</span><strong id="step-time">—</strong></div>
+        <div class="metric"><span>STATE</span><strong id="sim-state">READY</strong></div>
+      </div>
+      <div class="control">
+        <div class="control-label"><label for="elasticity">Elasticity</label><output id="elasticity-value">34</output></div>
+        <input id="elasticity" type="range" min="5" max="90" value="34" step="1">
+        <p>Neighbor spring stiffness</p>
+      </div>
+      <div class="control">
+        <div class="control-label"><label for="shape">Shape recovery</label><output id="shape-value">5.0</output></div>
+        <input id="shape" type="range" min="0" max="18" value="5" step="0.5">
+        <p>Pull toward each vertex's rest position</p>
+      </div>
+      <div class="control">
+        <div class="control-label"><label for="damping">Damping</label><output id="damping-value">2.8</output></div>
+        <input id="damping" type="range" min="0.2" max="10" value="2.8" step="0.1">
+        <p>Velocity attenuation per second</p>
+      </div>
+      <div class="control">
+        <div class="control-label"><label for="grab-radius">Grab radius</label><output id="grab-radius-value">0.34</output></div>
+        <input id="grab-radius" type="range" min="0.08" max="0.8" value="0.34" step="0.01">
+        <p>Influence radius around the picked point</p>
+      </div>
+      <div class="control">
+        <div class="control-label"><label for="grab-strength">Grab strength</label><output id="grab-strength-value">85</output></div>
+        <input id="grab-strength" type="range" min="10" max="220" value="85" step="1">
+        <p>How strongly nearby particles follow the pointer</p>
+      </div>
+      <button id="reset" class="primary">Reset sphere</button>
+      <div class="divider"></div>
+      <div class="info-block">
+        <div class="eyebrow">REFERENCE BACKEND</div>
+        <strong>GPU spring network</strong>
+        <p>100,489 surface vertices. Each simulation step evaluates local neighbor springs, shape recovery, damping, and pointer forces in floating-point GPU textures.</p>
+      </div>
+      <div class="info-block note">
+        <div class="eyebrow">RESEARCH NOTE</div>
+        <p>This is the conventional reference simulator. It is not an ML model yet. The next milestone is recording trajectories and training a GNS-style surrogate against this solver.</p>
+      </div>
+      <footer>NP · Neural Physics Sandbox</footer>
+    </aside>
+  </main>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
