@@ -6,11 +6,11 @@ A browser-based research sandbox for comparing conventional soft-body simulation
 
 The first milestone is a GPU-driven, approximately 100k-vertex deformable sphere. Drag the sphere surface with the pointer, release it, and observe its elastic recovery.
 
-> The initial backend is a conventional GPU spring/shape-restoration solver. It is a reference simulator and data-generation baseline, not a trained neural model. The project is structured so a learned GNS-style backend can be added and compared against it.
+> The browser demo currently uses a conventional GPU spring/shape-restoration solver. It is a reference simulator and data-generation baseline, not a trained neural model.
 
-## Run
+## Run the browser demo
 
-Open `index.html` through a local static HTTP server (WebGL2 is required). For example:
+Open `index.html` through a local static HTTP server (WebGL2 is required):
 
 ```bash
 python -m http.server 8000
@@ -34,70 +34,57 @@ Then visit http://localhost:8000.
 - Spring interactions use the four parametric grid neighbors
 - A shape-restoration term helps preserve the spherical rest shape
 
-## Dataset capture
+## Dataset formats
 
-The browser recorder exports `.npds` binary trajectory files. Version 1 stores a JSON metadata header followed by little-endian arrays in this order:
+The browser recorder currently exports NPDS v1. Its binary payload stores rest positions, undirected mesh edges, then per-frame positions and velocities. The file starts with the 8-byte magic `NPDS0001` and a uint32 little-endian JSON-header length.
 
-1. Rest positions: float32 [N, 3]
-2. Undirected triangle edges: uint32 [E, 2]
-3. For each frame: positions float32 [N, 3], then velocities float32 [N, 3]
+The MeshGraphNets DeformingPlate importer writes NPDS v2. It stores:
 
-The file starts with the 8-byte magic `NPDS0001`, followed by a uint32 little-endian JSON-header byte length. Captures are sampled at 10, 20, or 30 Hz. The default is a 2-second capture because 100k-node float32 trajectories create large files (about 2.4 MB per frame). The current sphere is the first data-generation source; use different meshes and material settings in later dataset-generation milestones to test cross-mesh generalization.
+1. Reference mesh positions: float32 [N, 3]
+2. Undirected tetrahedral mesh edges: uint32 [E, 2]
+3. Node types: int32 [N]
+4. Per frame: world positions float32 [N, 3], then stress float32 [N]
 
-## Train the first graph-network baseline
+NPDS v2 uses the magic `NPDS0002`. The reader supports both versions. V1 remains the browser-capture format; V2 preserves structural-mechanics features that cannot be represented by the old position/velocity-only layout.
 
-Install the Python dependencies:
+## Python setup
 
-```bash
+```powershell
 python -m venv .venv
-# Windows PowerShell:
-.venv\\Scripts\\Activate.ps1
-# Linux/macOS:
-# source .venv/bin/activate
+.\.venv\Scripts\Activate.ps1
 pip install -r training/requirements.txt
 ```
 
-Put one or more downloaded `.npds` files in `data/`, then run:
+## DeformingPlate experiment
 
-```bash
-python training/train.py --data data --epochs 100
-```
-
-For a meaningful cross-mesh generalization measurement, put trajectories from entirely different held-out shapes in `validation/` and run:
-
-```bash
-python training/train.py --data data/train --validation-data data/validation
-```
-
-The prototype is a resolution-independent message-passing network: node count is not fixed in the model. It predicts per-vertex acceleration from deformation, velocity, rest position, and mesh adjacency. This is an initial research baseline, not yet a robust general-purpose material model. Current capture UI produces the sphere reference trajectory; collect additional shapes before interpreting validation results as cross-shape generalization.
-
-
-## Import the public MeshGraphNets dataset
-
-The first external-data experiment uses DeepMind's `deforming_plate` structural-mechanics trajectories. The source files are official TFRecords; the importer converts each trajectory into the NPDS format already used by this project. TensorFlow is not required.
-
-Download the official dataset (all splits):
+This experiment uses the public DeepMind MeshGraphNets DeformingPlate dataset. Download the TFRecords (TensorFlow is not required by the converter):
 
 ```powershell
 .\.venv\Scripts\python.exe training/download_meshgraphnets.py --dataset deforming_plate --split all
 ```
 
-Convert a small starter subset (8 trajectories by default):
+Convert a starter subset:
 
 ```powershell
 .\.venv\Scripts\python.exe training/convert_meshgraphnets.py --input data/meshgraphnets/deforming_plate --split train --max-trajectories 8 --output data/deforming_plate_train
 .\.venv\Scripts\python.exe training/convert_meshgraphnets.py --input data/meshgraphnets/deforming_plate --split valid --max-trajectories 2 --output data/deforming_plate_valid
 ```
 
-Train and validate:
+Train:
 
 ```powershell
 .\.venv\Scripts\python.exe training/train.py --data data/deforming_plate_train --validation-data data/deforming_plate_valid --epochs 100
 ```
 
-The trainer evaluates every frame transition in the selected evaluation split (rather than only the final transition). Full evaluation runs every 10 epochs by default and always runs on the final epoch; change this with `--evaluation-interval`. It reports acceleration MSE alongside a zero-acceleration baseline, selects and saves the best checkpoint by full-trajectory evaluation MSE, then reports autoregressive rollout position RMSE over all frames and at the final frame. The rollout starts from the ground-truth first frame and thereafter uses only model-predicted accelerations.
+### Model and boundary conditions
 
-Use `--max-trajectories 0` to convert every trajectory in a split. The converter currently imports fixed-topology triangle or tetrahedral meshes and position trajectories. Two-dimensional coordinates are padded with a zero Z coordinate. It derives velocity from consecutive positions. If the metadata provides a positive physical timestep, that value is used; otherwise the importer uses `--timestep 1.0` (one normalized frame interval). DeformingPlate does not provide a usable physical `dt`, so the fallback keeps derivatives in frame-based units; it does not recover physical seconds. The DeformingPlate benchmark is structural mechanics data, not a general 3D soft-body dataset; it is used here to validate the public-data ingestion and training pipeline.
+DeformingPlate metadata has `dt=0`; its frames are structural states, not samples at a physical time interval. The importer therefore does not derive physical velocity or acceleration and does not apply a fallback timestep.
+
+The model predicts the next-frame vertex displacement and scalar stress. Node type is encoded as a three-class one-hot feature (raw values 0, 1, and 3). The two constrained classes (1 and 3) are overwritten with their exact next-frame positions during training and evaluation, matching the dataset's prescribed boundary-condition treatment. The network learns the moving vertices (type 0); its displacement loss and rollout metrics are reported on those vertices. Stress is supervised as an auxiliary output.
+
+The trainer uses differentiable autoregressive rollouts, evaluates the complete validation trajectories at the configured interval, and selects the checkpoint by moving-node rollout RMSE. It also reports a zero-displacement baseline, teacher-forced displacement MSE, and stress RMSE. The baseline applies the same exact boundary conditions, so the comparison measures what the learned model adds on unconstrained vertices.
+
+If the converter or NPDS layout changes, regenerate the dataset files before training. In particular, existing NPDS v1 files do not contain the required DeformingPlate node types or stress values.
 
 Source: https://github.com/google-deepmind/deepmind-research/tree/master/meshgraphnets
 
