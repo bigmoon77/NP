@@ -30,7 +30,6 @@ def prepare_trajectory(trajectory: Trajectory, device: torch.device) -> dict:
         "source": trajectory,
         "rest": torch.as_tensor(trajectory.rest_positions, dtype=torch.float32, device=device),
         "positions": torch.as_tensor(trajectory.positions, dtype=torch.float32, device=device),
-        "stress": torch.as_tensor(trajectory.stress, dtype=torch.float32, device=device),
         "node_types": torch.as_tensor(trajectory.node_types, dtype=torch.long, device=device),
         "edges": make_edge_index(trajectory.edges, device),
     }
@@ -41,8 +40,6 @@ def compute_normalization(data_list: list[dict]) -> dict[str, float]:
     edge_count = 0
     displacement_squared_sum = 0.0
     displacement_count = 0
-    stress_squared_sum = 0.0
-    stress_count = 0
 
     for data in data_list:
         rest = data["rest"]
@@ -58,18 +55,23 @@ def compute_normalization(data_list: list[dict]) -> dict[str, float]:
             displacement_squared_sum += torch.sum(moving_delta * moving_delta).item()
             displacement_count += moving_delta.numel()
 
-        stress = data["stress"]
-        stress_squared_sum += torch.sum(stress * stress).item()
-        stress_count += stress.numel()
-
     length_scale = float(np.sqrt(edge_squared_sum / max(edge_count, 1)))
     displacement_scale = float(np.sqrt(displacement_squared_sum / max(displacement_count, 1)))
-    stress_scale = float(np.sqrt(stress_squared_sum / max(stress_count, 1)))
     return {
         "length_scale": max(length_scale, 1.0e-8),
         "displacement_scale": max(displacement_scale, max(length_scale, 1.0e-8) * 1.0e-6),
-        "stress_scale": max(stress_scale, 1.0e-8),
     }
+
+
+def get_prescribed_motion(
+    current_positions: torch.Tensor,
+    exact_next_positions: torch.Tensor,
+    node_types: torch.Tensor,
+) -> torch.Tensor:
+    # Node types 1 and 3 have known next-frame positions in this dataset.
+    known_mask = (node_types == 1) | (node_types == 3)
+    motion = exact_next_positions - current_positions
+    return torch.where(known_mask.unsqueeze(-1), motion, torch.zeros_like(motion))
 
 
 def apply_known_boundary_positions(
@@ -98,22 +100,18 @@ def compute_rollout_training_loss(
     for step in range(horizon):
         frame = start_frame + step
         target_position = data["positions"][frame + 1]
-        target_stress = data["stress"][frame + 1]
-        predicted_delta, predicted_stress = model(
-            data["rest"], position, node_types, data["edges"], **normalization
+        prescribed_motion = get_prescribed_motion(position, target_position, node_types)
+        predicted_delta = model(
+            data["rest"], position, node_types, data["edges"],
+            prescribed_motion=prescribed_motion, **normalization,
         )
         predicted_position = position + predicted_delta
         position = apply_known_boundary_positions(predicted_position, target_position, node_types)
-
         position_loss = F.mse_loss(
             (position[moving_mask] - target_position[moving_mask]) / normalization["displacement_scale"],
             torch.zeros_like(target_position[moving_mask]),
         )
-        stress_loss = F.mse_loss(
-            predicted_stress / normalization["stress_scale"],
-            target_stress / normalization["stress_scale"],
-        )
-        step_losses.append(position_loss + 0.25 * stress_loss)
+        step_losses.append(position_loss)
 
     return torch.stack(step_losses).mean()
 
@@ -122,39 +120,32 @@ def evaluate_teacher_forced(
     model: MeshGraphSimulator,
     datasets: list[dict],
     normalization: dict[str, float],
-) -> tuple[float, float, float]:
+) -> tuple[float, float]:
     model.eval()
     delta_error_sum = 0.0
     zero_error_sum = 0.0
-    stress_error_sum = 0.0
     delta_count = 0
-    stress_count = 0
 
     with torch.no_grad():
         for data in datasets:
             moving_mask = data["node_types"] == 0
             for frame in range(data["source"].frame_count - 1):
-                target_delta = data["positions"][frame + 1] - data["positions"][frame]
-                predicted_delta, predicted_stress = model(
-                    data["rest"], data["positions"][frame], data["node_types"],
-                    data["edges"], **normalization,
+                current = data["positions"][frame]
+                target = data["positions"][frame + 1]
+                target_delta = target - current
+                prescribed_motion = get_prescribed_motion(current, target, data["node_types"])
+                predicted_delta = model(
+                    data["rest"], current, data["node_types"], data["edges"],
+                    prescribed_motion=prescribed_motion, **normalization,
                 )
                 difference = predicted_delta[moving_mask] - target_delta[moving_mask]
                 delta_error_sum += torch.sum(difference * difference).item()
                 zero_error_sum += torch.sum(target_delta[moving_mask] ** 2).item()
                 delta_count += target_delta[moving_mask].numel()
 
-                stress_difference = predicted_stress - data["stress"][frame + 1]
-                stress_error_sum += torch.sum(stress_difference * stress_difference).item()
-                stress_count += stress_difference.numel()
-
-    if delta_count == 0 or stress_count == 0:
-        return float("nan"), float("nan"), float("nan")
-    return (
-        delta_error_sum / delta_count,
-        zero_error_sum / delta_count,
-        float(np.sqrt(stress_error_sum / stress_count)),
-    )
+    if delta_count == 0:
+        return float("nan"), float("nan")
+    return delta_error_sum / delta_count, zero_error_sum / delta_count
 
 
 def evaluate_rollout(
@@ -172,25 +163,20 @@ def evaluate_rollout(
     with torch.no_grad():
         for data in datasets:
             source = data["source"]
-            states = {
-                name: data["positions"][0].clone()
-                for name in names
-            }
+            states = {name: data["positions"][0].clone() for name in names}
             node_types = data["node_types"]
             moving_mask = node_types == 0
 
             for frame in range(source.frame_count - 1):
                 target = data["positions"][frame + 1]
-                if "gnn" in states:
-                    delta, _ = model(
-                        data["rest"], states["gnn"], node_types,
-                        data["edges"], **normalization,
-                    )
-                    gnn_position = states["gnn"] + delta
-                    states["gnn"] = apply_known_boundary_positions(gnn_position, target, node_types)
-
-                zero_position = states["zero"].clone()
-                states["zero"] = apply_known_boundary_positions(zero_position, target, node_types)
+                prescribed_motion = get_prescribed_motion(states["gnn"], target, node_types)
+                delta = model(
+                    data["rest"], states["gnn"], node_types, data["edges"],
+                    prescribed_motion=prescribed_motion, **normalization,
+                )
+                gnn_position = states["gnn"] + delta
+                states["gnn"] = apply_known_boundary_positions(gnn_position, target, node_types)
+                states["zero"] = apply_known_boundary_positions(states["zero"], target, node_types)
 
                 for name in names:
                     difference = states[name][moving_mask] - target[moving_mask]
@@ -215,7 +201,7 @@ def evaluate_rollout(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train a resolution-independent quasi-static DeformingPlate graph model."
+        description="Train a quasi-static DeformingPlate graph model with prescribed boundary motion."
     )
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--validation-data", type=Path, default=None)
@@ -240,7 +226,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     if args.device == "cuda" and not torch.cuda.is_available():
-        raise SystemExit("CUDA was requested, but is not available")
+        raise SystemExit("CUDA was requested, but CUDA is not available")
     device = torch.device(
         "cuda" if args.device == "auto" and torch.cuda.is_available()
         else "cpu" if args.device == "auto" else args.device
@@ -270,8 +256,7 @@ def main() -> None:
     print(
         "Normalization: "
         f"length={normalization['length_scale']:.6e}, "
-        f"displacement={normalization['displacement_scale']:.6e}, "
-        f"stress={normalization['stress_scale']:.6e}"
+        f"displacement={normalization['displacement_scale']:.6e}"
     )
 
     model = MeshGraphSimulator(args.hidden_size, args.message_passing_steps).to(device)
@@ -299,15 +284,12 @@ def main() -> None:
             print(f"epoch {epoch + 1:04d} train={np.mean(losses):.6e} eval=skipped")
             continue
 
-        delta_mse, zero_delta_mse, stress_rmse = evaluate_teacher_forced(
-            model, evaluation_data, normalization
-        )
+        delta_mse, zero_delta_mse = evaluate_teacher_forced(model, evaluation_data, normalization)
         rollout_metrics = evaluate_rollout(model, evaluation_data, normalization)
         rollout_rmse = rollout_metrics["gnn"][0]
         print(
             f"epoch {epoch + 1:04d} train={np.mean(losses):.6e} "
             f"delta_mse={delta_mse:.6e} zero_delta_mse={zero_delta_mse:.6e} "
-            f"stress_rmse={stress_rmse:.6e} "
             f"rollout_rmse={rollout_rmse:.6e} "
             f"zero_rollout_rmse={rollout_metrics['zero'][0]:.6e}"
         )
@@ -320,27 +302,30 @@ def main() -> None:
         raise RuntimeError("Training did not produce a checkpoint")
     model.load_state_dict(best_state)
     final_metrics = evaluate_rollout(model, evaluation_data, normalization)
-    delta_mse, zero_delta_mse, stress_rmse = evaluate_teacher_forced(
-        model, evaluation_data, normalization
-    )
+    delta_mse, zero_delta_mse = evaluate_teacher_forced(model, evaluation_data, normalization)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "model_state_dict": best_state,
-            "model_kind": "deforming_plate_quasistatic",
+            "model_kind": "deforming_plate_quasistatic_boundary_conditioned",
             "hidden_size": args.hidden_size,
             "message_passing_steps": args.message_passing_steps,
-            "input_features": ["position_minus_mesh_pos", "centered_mesh_pos", "node_type_one_hot"],
-            "outputs": ["world_pos_delta", "stress"],
+            "input_features": [
+                "position_minus_mesh_pos",
+                "centered_mesh_pos",
+                "prescribed_boundary_displacement",
+                "node_type_one_hot",
+            ],
+            "outputs": ["world_pos_delta"],
             "node_type_values": {"0": "moving", "1": "object", "3": "clamped"},
+            "known_boundary_node_types": [1, 3],
             "normalization": normalization,
             "best_epoch": best_epoch,
             "best_rollout_rmse": best_loss,
             "rollout_metrics": final_metrics,
             "teacher_forced_delta_mse": delta_mse,
             "zero_delta_baseline_mse": zero_delta_mse,
-            "stress_rmse": stress_rmse,
             "seed": args.seed,
         },
         args.output,
@@ -349,7 +334,6 @@ def main() -> None:
     print(f"Best moving-node rollout RMSE: {best_loss:.6e}")
     print(f"Teacher-forced displacement MSE: {delta_mse:.6e}")
     print(f"Zero-displacement baseline MSE: {zero_delta_mse:.6e}")
-    print(f"Teacher-forced stress RMSE: {stress_rmse:.6e}")
     for name, (all_frames_rmse, final_frame_rmse) in final_metrics.items():
         print(f"Rollout {name}: all_frames_rmse={all_frames_rmse:.6e} final_frame_rmse={final_frame_rmse:.6e}")
     print(f"Saved checkpoint: {args.output}")
