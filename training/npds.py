@@ -15,7 +15,9 @@ class Trajectory:
     rest_positions: np.ndarray
     edges: np.ndarray
     positions: np.ndarray
-    velocities: np.ndarray
+    velocities: np.ndarray | None
+    node_types: np.ndarray | None
+    stress: np.ndarray | None
 
     @property
     def frame_count(self) -> int:
@@ -27,22 +29,25 @@ class Trajectory:
 
     @property
     def dt(self) -> float:
-        return float(self.header["capture_dt"])
+        return float(self.header.get("capture_dt", 0.0))
 
 
 def load_npds(path: str | Path) -> Trajectory:
     file_path = Path(path)
     payload = file_path.read_bytes()
-    if len(payload) < 12 or payload[:8] != b"NPDS0001":
+    if len(payload) < 12 or payload[:8] not in (b"NPDS0001", b"NPDS0002"):
         raise ValueError(f"{file_path}: invalid NPDS magic or truncated header")
 
+    version = int(payload[7:8].decode("ascii"))
+    if version not in (1, 2):
+        raise ValueError(f"{file_path}: unsupported NPDS version {version}")
     header_size = struct.unpack_from("<I", payload, 8)[0]
     header_end = 12 + header_size
     if header_end > len(payload):
         raise ValueError(f"{file_path}: truncated JSON header")
     header = json.loads(payload[12:header_end].decode("utf-8"))
-    if header.get("format") != "NPDS" or header.get("version") != 1:
-        raise ValueError(f"{file_path}: unsupported NPDS format")
+    if header.get("format") != "NPDS" or header.get("version") != version:
+        raise ValueError(f"{file_path}: header version does not match file magic")
 
     node_count = int(header["vertex_count"])
     edge_count = int(header["edge_count"])
@@ -51,8 +56,11 @@ def load_npds(path: str | Path) -> Trajectory:
 
     rest_size = node_count * 3 * 4
     edge_size = edge_count * 2 * 4
-    frame_size = node_count * 3 * 4 * 2
-    expected_size = offset + rest_size + edge_size + frame_count * frame_size
+    node_type_size = node_count * 4 if version == 2 else 0
+    frame_value_size = node_count * 3 * 4
+    stress_size = node_count * 4 if version == 2 else 0
+    per_frame_size = frame_value_size * (2 if version == 1 else 1) + stress_size
+    expected_size = offset + rest_size + edge_size + node_type_size + frame_count * per_frame_size
     if len(payload) != expected_size:
         raise ValueError(
             f"{file_path}: byte size mismatch (expected {expected_size}, got {len(payload)})"
@@ -60,22 +68,37 @@ def load_npds(path: str | Path) -> Trajectory:
 
     rest = np.frombuffer(payload, dtype="<f4", count=node_count * 3, offset=offset)
     offset += rest_size
-    edges = np.frombuffer(payload, dtype="<u4", count=edge_count * 2, offset=offset)
+    edges_raw = np.frombuffer(payload, dtype="<u4", count=edge_count * 2, offset=offset)
     offset += edge_size
 
+    node_types = None
+    if version == 2:
+        node_types = np.frombuffer(
+            payload, dtype="<i4", count=node_count, offset=offset
+        ).astype(np.int64, copy=True)
+        offset += node_type_size
+
     positions = np.empty((frame_count, node_count, 3), dtype=np.float32)
-    velocities = np.empty_like(positions)
+    velocities = np.empty_like(positions) if version == 1 else None
+    stress = np.empty((frame_count, node_count), dtype=np.float32) if version == 2 else None
+
     for frame_index in range(frame_count):
         positions[frame_index] = np.frombuffer(
             payload, dtype="<f4", count=node_count * 3, offset=offset
         ).reshape(node_count, 3)
-        offset += node_count * 3 * 4
-        velocities[frame_index] = np.frombuffer(
-            payload, dtype="<f4", count=node_count * 3, offset=offset
-        ).reshape(node_count, 3)
-        offset += node_count * 3 * 4
+        offset += frame_value_size
+        if version == 1:
+            velocities[frame_index] = np.frombuffer(
+                payload, dtype="<f4", count=node_count * 3, offset=offset
+            ).reshape(node_count, 3)
+            offset += frame_value_size
+        else:
+            stress[frame_index] = np.frombuffer(
+                payload, dtype="<f4", count=node_count, offset=offset
+            )
+            offset += stress_size
 
-    if edge_count and int(edges.max()) >= node_count:
+    if edge_count and int(edges_raw.max()) >= node_count:
         raise ValueError(f"{file_path}: edge index exceeds vertex count")
     if frame_count < 2:
         raise ValueError(f"{file_path}: at least two frames are required for training")
@@ -84,7 +107,9 @@ def load_npds(path: str | Path) -> Trajectory:
         path=file_path,
         header=header,
         rest_positions=rest.reshape(node_count, 3).copy(),
-        edges=edges.reshape(edge_count, 2).astype(np.int64, copy=True),
+        edges=edges_raw.reshape(edge_count, 2).astype(np.int64, copy=True),
         positions=positions,
         velocities=velocities,
+        node_types=node_types,
+        stress=stress,
     )
