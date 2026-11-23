@@ -90,7 +90,7 @@ class MeshGraphSimulator(nn.Module):
         type_indices = torch.where(node_types == 3, 2, node_types).long()
         type_features = F.one_hot(type_indices, num_classes=3).to(positions.dtype)
         features = torch.cat(
-            ((positions - rest_positions) / length_scale, centered_rest / length_scale, type_features),
+            ((positions - rest_positions) / displacement_scale, centered_rest / length_scale, type_features),
             dim=-1,
         )
         hidden = self.encoder(features)
